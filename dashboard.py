@@ -8,19 +8,31 @@ not a two-bucket approximation.
   Tab 1  Approach 1: Diversified Large-Cap   (lower risk)
   Tab 2  Approach 2: Momentum / Speculative  (higher risk, higher swing)
   Tab 3  Approach 3: Markowitz-Optimized     (real optimizer, full covariance)
-  Tab 4  How to read this
+  Tab 4  Market Timing & News Sentiment      (rules-based signal, not a prediction)
+  Tab 5  How to read this
 
 Run locally:   streamlit run dashboard.py
 Deploy free:   share.streamlit.io  (sign in with GitHub)
 
-Data: yfinance (free, no API key). Prices refresh every time the app opens.
+Data: yfinance (free, no API key) for prices/VIX; Google News RSS (free,
+no API key) for headlines. Prices refresh every time the app opens.
+
+IMPORTANT — what Tab 4 actually is:
+It is a RULES-BASED SIGNAL, not a prediction. Market timing = VIX level +
+S&P trend, scored against plain thresholds anyone can read. News sentiment =
+counting positive/negative keywords in recent free headlines per stock. Both
+are real and computed live, but neither forecasts price. No free data source
+can reliably do that, and this app does not pretend otherwise.
 """
 
+import re
 import numpy as np
 import pandas as pd
 import streamlit as st
 import yfinance as yf
 import warnings
+import urllib.request
+import xml.etree.ElementTree as ET
 
 warnings.filterwarnings("ignore")
 
@@ -182,6 +194,116 @@ def markowitz_real(df, prices):
 
 
 # ----------------------------------------------------------------------------
+# MARKET TIMING — rules-based signal, not a prediction
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=3600, show_spinner=False)
+def market_timing_signal():
+    """VIX level + S&P 500 trend, scored against plain, visible thresholds.
+    This is a RULE, not a forecast: it tells you current conditions relative
+    to historical norms, nothing about what happens next."""
+    try:
+        vix = yf.Ticker("^VIX").history(period="5d")["Close"].iloc[-1]
+        spx = yf.Ticker("^GSPC").history(period="260d")["Close"]
+        spx_now = spx.iloc[-1]
+        spx_ma50 = spx.rolling(50).mean().iloc[-1]
+        spx_ma200 = spx.rolling(200).mean().iloc[-1]
+    except Exception:
+        return None
+
+    # VIX thresholds are the standard, widely-published bands
+    if vix < 15:
+        vix_label, vix_note = "Low / Complacent", "Calm markets — historically can precede surprises either way."
+    elif vix < 20:
+        vix_label, vix_note = "Normal", "Typical volatility range."
+    elif vix < 30:
+        vix_label, vix_note = "Elevated", "Markets pricing in real uncertainty."
+    else:
+        vix_label, vix_note = "High / Fear", "Historically often (not always) followed by a recovery — but can persist or worsen."
+
+    trend_up = spx_now > spx_ma50 and spx_now > spx_ma200
+    trend_label = "Uptrend (above both 50d & 200d avg)" if trend_up else (
+        "Mixed / below long-term trend" if spx_now < spx_ma200 else "Mixed")
+
+    # Simple combined score: trend matters more than VIX alone
+    score = 50
+    score += 20 if trend_up else -20
+    score += 15 if vix < 20 else (0 if vix < 30 else -15)
+    score = max(0, min(100, score))
+
+    if score >= 65:
+        regime, guidance = "Favorable", "Conditions historically associated with continuing to invest on schedule."
+    elif score >= 40:
+        regime, guidance = "Neutral", "No strong signal either way — sticking to your regular schedule is reasonable."
+    else:
+        regime, guidance = "Cautious", "Elevated fear and/or a weak trend. Some investors stay the course anyway (timing the market is notoriously hard); others reduce size this month. Your call, not the model's."
+
+    return {
+        "vix": vix, "vix_label": vix_label, "vix_note": vix_note,
+        "spx_now": spx_now, "spx_ma50": spx_ma50, "spx_ma200": spx_ma200,
+        "trend_label": trend_label, "score": score,
+        "regime": regime, "guidance": guidance,
+    }
+
+
+# ----------------------------------------------------------------------------
+# NEWS SENTIMENT — free headline keyword scoring per stock, not NLP magic
+# ----------------------------------------------------------------------------
+POS_WORDS = {"beat", "beats", "surge", "surges", "soar", "soars", "rally", "rallies",
+             "upgrade", "upgraded", "record", "strong", "growth", "profit", "gain",
+             "gains", "jump", "jumps", "outperform", "bullish", "buy", "raises",
+             "raised", "exceeds", "optimis", "expand", "expands", "win", "wins"}
+NEG_WORDS = {"miss", "misses", "plunge", "plunges", "slump", "slumps", "downgrade",
+             "downgraded", "weak", "loss", "losses", "fall", "falls", "falling",
+             "drop", "drops", "cut", "cuts", "lawsuit", "probe", "investigation",
+             "bearish", "sell", "lowers", "lowered", "warns", "warning", "recall",
+             "layoff", "layoffs", "decline", "declines"}
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def fetch_headlines(ticker, company, max_items=10):
+    """Free Google News RSS, no API key. Returns recent headline titles."""
+    query = f"{ticker} {company} stock".replace(" ", "%20")
+    url = f"https://news.google.com/rss/search?q={query}&hl=en-US&gl=US&ceid=US:en"
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        with urllib.request.urlopen(req, timeout=6) as resp:
+            tree = ET.fromstring(resp.read())
+        items = tree.findall(".//item/title")
+        return [i.text for i in items[:max_items] if i.text]
+    except Exception:
+        return []
+
+
+def score_headline(text):
+    words = set(re.findall(r"[a-z']+", text.lower()))
+    pos = sum(1 for w in words if any(w.startswith(p) for p in POS_WORDS))
+    neg = sum(1 for w in words if any(w.startswith(n) for n in NEG_WORDS))
+    return pos - neg
+
+
+@st.cache_data(ttl=1800, show_spinner=False)
+def news_sentiment_table(tickers_companies):
+    """Per-stock sentiment: average keyword score across recent free headlines.
+    This is keyword counting, not language understanding — crude by design,
+    and openly labeled as such. Headline tone is noisy and often LAGS price
+    rather than leading it."""
+    rows = []
+    for ticker, company in tickers_companies:
+        heads = fetch_headlines(ticker, company)
+        if not heads:
+            rows.append({"Ticker": ticker, "Headlines Found": 0,
+                        "Sentiment Score": np.nan, "Sample Headline": "No headlines found"})
+            continue
+        scores = [score_headline(h) for h in heads]
+        rows.append({
+            "Ticker": ticker,
+            "Headlines Found": len(heads),
+            "Sentiment Score": float(np.mean(scores)),
+            "Sample Headline": heads[0],
+        })
+    return pd.DataFrame(rows)
+
+
+# ----------------------------------------------------------------------------
 # RENDER
 # ----------------------------------------------------------------------------
 st.title("📈 My US Stock Model")
@@ -203,10 +325,12 @@ c2.metric("Universe avg. 12mo return", f"{df['Return 12mo'].mean():.1%}")
 c3.metric("Universe avg. volatility", f"{df['Volatility'].mean():.1%}")
 c4.metric("Last updated", pd.Timestamp.now().strftime("%d %b %Y, %H:%M"))
 
-d1, d2, d3, d4 = st.tabs([
+d1, d2, d3, d4, d5, d6 = st.tabs([
     "🟢 Approach 1 — Diversified",
     "🔴 Approach 2 — Momentum",
     "🔵 Approach 3 — Markowitz",
+    "📰 Market Timing & News",
+    "✅ Summary — What to Buy",
     "❓ How to read this",
 ])
 
@@ -288,8 +412,188 @@ with d3:
                    f"{OPT_MAX_WEIGHT:.0%}, and uses a {RISK_FREE:.1%} risk-free rate. "
                    f"These are all editable in the settings block at the top of the file.")
 
-# ---------------- Guide ----------------
+# ---------------- Market Timing & News Sentiment ----------------
 with d4:
+    st.subheader("Market timing & news sentiment — signals, not predictions")
+    st.info(
+        "Read this first: nothing on this tab forecasts price. The timing gauge is a "
+        "**rule** applied to two live indicators, and the stock sentiment column is "
+        "**keyword counting** on free headlines. Both are useful context for *when* to "
+        "deploy money and *what tone* surrounds a name. Neither knows what happens next."
+    )
+
+    # ---- Part A: market timing ----
+    st.markdown("### Should I invest this month?")
+    with st.spinner("Reading VIX and the S&P 500 trend..."):
+        timing = market_timing_signal()
+
+    if timing is None:
+        st.warning("Couldn't reach the market indicators right now. Try reloading.")
+    else:
+        t1, t2, t3 = st.columns(3)
+        t1.metric("VIX (fear gauge)", f"{timing['vix']:.1f}", timing["vix_label"])
+        t2.metric("S&P 500 trend", timing["trend_label"].split(" (")[0])
+        t3.metric("Timing score", f"{timing['score']:.0f}/100", timing["regime"])
+
+        if timing["regime"] == "Favorable":
+            st.success(f"**{timing['regime']}** — {timing['guidance']}")
+        elif timing["regime"] == "Neutral":
+            st.info(f"**{timing['regime']}** — {timing['guidance']}")
+        else:
+            st.warning(f"**{timing['regime']}** — {timing['guidance']}")
+
+        st.write("**What produced that score:**")
+        st.dataframe(pd.DataFrame({
+            "Indicator": ["VIX level", "VIX read", "S&P 500 vs 50-day avg",
+                          "S&P 500 vs 200-day avg"],
+            "Value": [f"{timing['vix']:.1f}", timing["vix_label"],
+                      f"{timing['spx_now']:,.0f} vs {timing['spx_ma50']:,.0f}",
+                      f"{timing['spx_now']:,.0f} vs {timing['spx_ma200']:,.0f}"],
+        }), use_container_width=True, hide_index=True)
+
+        st.caption(f"{timing['vix_note']} Score = 50 to start, +20 for an uptrend "
+                   f"(−20 otherwise), +15 for VIX under 20 (−15 above 30). "
+                   f"Thresholds are visible in the code and you can change them.")
+
+    st.divider()
+
+    # ---- Part B: per-stock news sentiment ----
+    st.markdown("### News tone on your watchlist")
+    st.write("Counts positive vs negative words across the most recent free headlines "
+             "for each stock. A negative score means the headlines skew bearish right "
+             "now — not that the stock will fall.")
+
+    with st.spinner("Scanning recent headlines..."):
+        sent = news_sentiment_table([(u[0], u[1]) for u in UNIVERSE])
+
+    if sent.empty:
+        st.info("No headlines could be retrieved right now.")
+    else:
+        sent_sorted = sent.sort_values("Sentiment Score", ascending=False,
+                                       na_position="last")
+        st.dataframe(
+            sent_sorted.style.format({"Sentiment Score": "{:+.1f}"}, na_rep="n/a"),
+            use_container_width=True, hide_index=True,
+        )
+
+        rated = sent_sorted.dropna(subset=["Sentiment Score"])
+        if not rated.empty:
+            p1, p2 = st.columns(2)
+            p1.metric("Most positive tone right now", rated.iloc[0]["Ticker"],
+                      f"{rated.iloc[0]['Sentiment Score']:+.1f}")
+            p2.metric("Most negative tone right now", rated.iloc[-1]["Ticker"],
+                      f"{rated.iloc[-1]['Sentiment Score']:+.1f}")
+
+        st.caption("Scores run from roughly −3 (heavy negative tone) to +3 (heavy "
+                   "positive). This is keyword matching, not language understanding — "
+                   "treat it as a quick read of headline mood, and check the sample "
+                   "headline yourself before acting on any single row.")
+
+# ---------------- Summary & Buy Plan ----------------
+with d5:
+    st.subheader("What to buy, and is now a good time")
+
+    # ---- Part A: is today a good time ----
+    timing = market_timing_signal()
+    if timing is None:
+        st.warning("Couldn't read the market indicators right now — timing score unavailable.")
+        timing_score, timing_regime, timing_label = 50, "Unknown", "n/a"
+    else:
+        timing_score = timing["score"]
+        timing_regime = timing["regime"]
+        timing_label = f"{timing_score:.0f}/100"
+
+    st.markdown("#### 1. Is today a good time to invest?")
+    a1, a2, a3 = st.columns(3)
+    a1.metric("Timing score", timing_label, timing_regime if timing else "")
+    a2.metric("Today", pd.Timestamp.now().strftime("%d %b %Y, %H:%M"))
+    a3.metric("Recommendation from the score", 
+              "Full amount" if timing_score >= 65
+              else ("Normal amount" if timing_score >= 40 else "Reduced amount"))
+
+    gauge = int(round(timing_score))
+    pct_good = gauge / 100
+    st.progress(pct_good)
+    st.write(f"**{gauge}% favourable** on this rule "
+             f"({timing_regime} regime). Read it as opinion from a fixed rule, "
+             f"not a forecast.")
+
+    if timing:
+        if timing_regime == "Favorable":
+            st.success("Conditions look favourable on this rule — investing the "
+                       "full monthly amount is reasonable.")
+        elif timing_regime == "Neutral":
+            st.info("No strong signal either way — sticking to your usual schedule "
+                    "is reasonable.")
+        else:
+            st.warning("Conditions look cautious on this rule. Some investors stay the "
+                       "course anyway (timing is notoriously hard); others reduce size "
+                       "this month. Your call.")
+
+    st.divider()
+
+    # ---- Part B: the buy plan ----
+    st.markdown("#### 2. What to buy this month")
+
+    contribution = st.number_input(
+        "How much are you investing this month? ($)",
+        min_value=50, max_value=100000, value=1000, step=50,
+    )
+
+    plan_source = st.radio(
+        "Build the buy list from which approach?",
+        ["Approach 1 — Diversified", "Approach 2 — Momentum",
+         "Approach 3 — Markowitz", "Blended (80% Diversified / 20% Momentum)"],
+        horizontal=False,
+    )
+
+    def to_buy(weights_df, total):
+        out = weights_df.copy()
+        out["Amount ($)"] = (out["Weight"] * total).round(0)
+        out["Shares (approx.)"] = (out["Amount ($)"] / out["Price"]).round(3)
+        return out[["Ticker", "Company", "Price", "Weight", "Amount ($)", "Shares (approx.)"]]
+
+    if plan_source.startswith("Approach 1"):
+        base = diversified_picks(df)
+    elif plan_source.startswith("Approach 2"):
+        base = momentum_picks(df)
+    elif plan_source.startswith("Approach 3"):
+        opt, _ = markowitz_real(df, prices)
+        base = opt if opt is not None else diversified_picks(df)
+    else:
+        core = diversified_picks(df).copy()
+        core["Weight"] = core["Weight"] * 0.8
+        mom = momentum_picks(df).copy()
+        mom["Weight"] = mom["Weight"] * 0.2
+        base = pd.concat([core, mom])
+
+    plan = to_buy(base, contribution)
+    shown = plan.copy()
+    shown["Weight"] = shown["Weight"].map(lambda x: f"{x:.1%}")
+    shown["Amount ($)"] = shown["Amount ($)"].map(lambda x: f"${x:,.0f}")
+    st.dataframe(shown.style.format({"Price": "${:,.2f}", "Shares (approx.)": "{:.3f}"}),
+                 use_container_width=True, hide_index=True)
+
+    st.metric("Total being invested", f"${plan['Amount ($)'].sum():,.0f}")
+    st.caption("Amounts are rounded to the nearest dollar, so they may total a few "
+               "dollars either side of your contribution. Reopen the app right before "
+               "you trade so the prices you act on are current.")
+
+    st.download_button(
+        "Download this buy list as CSV",
+        plan.to_csv(index=False).encode("utf-8"),
+        file_name="buy_list.csv",
+        mime="text/csv",
+    )
+
+    if timing and timing_regime == "Cautious":
+        st.info("The timing rule currently reads caution. A common middle path is to "
+                "buy the list above at a reduced size this month and keep the rest "
+                "aside for next month — that keeps you investing without ignoring the "
+                "signal.")
+
+# ---------------- Guide ----------------
+with d6:
     st.subheader("How to read this")
     st.markdown("""
 **The three approaches answer different questions.**
@@ -324,3 +628,5 @@ with d4:
 st.divider()
 st.caption("Decision-support tool, not financial advice. "
            "Past performance does not predict future returns.")
+
+
