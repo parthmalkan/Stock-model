@@ -100,34 +100,41 @@ def broad_universe():
     No API key. Returns list of (ticker, company, sector, bucket).
     Bucket is 'core' for large-caps (S&P 500), 'momentum' for the rest --
     the smaller/mid names are where the bigger swings live."""
-    wl = {
-        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies": "core",
-        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies": "momentum",
-        "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies": "momentum",
-    }
-    out, seen = [], set()
-    for url, bucket in wl.items():
+    sources = [
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_500_companies", "core"),
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_400_companies", "momentum"),
+        ("https://en.wikipedia.org/wiki/List_of_S%26P_600_companies", "momentum"),
+    ]
+    out, seen, report = [], set(), []
+    for url, bucket in sources:
+        label = url.rsplit("/", 1)[-1]
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                html = resp.read().decode("utf-8", errors="ignore")
-            # Pull the constituent table rows without pandas.read_html (heavier dep)
-            for m in re.finditer(
-                r"<tr>.*?<td[^>]*>\s*(?:<a[^>]*>)?\s*([A-Z][A-Z.\-]{0,5})\s*"
-                r"(?:</a>)?\s*</td>.*?<td[^>]*>(.*?)</td>.*?<td[^>]*>(.*?)</td>",
-                html, re.S,
-            ):
-                tkr = m.group(1).strip().replace(".", "-")
-                comp = re.sub(r"<[^>]+>", "", m.group(2)).strip()
-                sect = re.sub(r"<[^>]+>", "", m.group(3)).strip()
-                if tkr in seen or not comp:
+            tables = pd.read_html(url)
+            df = tables[0]
+            # Column names vary slightly between the three pages, so find them
+            tcol = next((c for c in df.columns if str(c).strip() in ("Symbol", "Ticker")), None)
+            ccol = next((c for c in df.columns if str(c).strip() in
+                         ("Security", "Company", "Company Name")), None)
+            scol = next((c for c in df.columns if "Sector" in str(c)), None)
+            if tcol is None or ccol is None:
+                report.append(f"{label}: columns not found")
+                continue
+            got = 0
+            for _, row in df.iterrows():
+                tkr = str(row[tcol]).strip().replace(".", "-")
+                if not tkr or tkr == "nan" or tkr in seen:
                     continue
                 seen.add(tkr)
-                out.append((tkr, comp[:60], sect[:30], bucket))
-        except Exception:
-            continue
+                out.append((tkr, str(row[ccol])[:60],
+                            str(row[scol])[:30] if scol else "\u2014", bucket))
+                got += 1
+            report.append(f"{label}: {got} names")
+        except Exception as e:
+            report.append(f"{label}: FAILED - {e}")
         if len(out) >= MAX_BROAD_NAMES:
             break
+    # Visible in the Streamlit logs so a failure is never silent again
+    print("[universe] " + " | ".join(report) + f" | TOTAL {len(out)}")
     return out[:MAX_BROAD_NAMES]
 
 # ----------------------------------------------------------------------------
@@ -136,7 +143,12 @@ def broad_universe():
 @st.cache_data(ttl=3600, show_spinner=False)   # cache 1 hour so it loads fast
 def load_data():
     if SCREEN_MODE == "broad":
-        names = broad_universe() or UNIVERSE
+        names = broad_universe()
+        if len(names) < 50:
+            st.warning(f"Broad screen returned only {len(names)} names "
+                       f"(check the app logs for which source failed). "
+                       f"Falling back to the curated list.")
+            names = UNIVERSE
     else:
         names = UNIVERSE
 
@@ -698,6 +710,9 @@ with d6:
 st.divider()
 st.caption("Decision-support tool, not financial advice. "
            "Past performance does not predict future returns.")
+
+
+
 
 
 
