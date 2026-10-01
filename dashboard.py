@@ -39,6 +39,17 @@ warnings.filterwarnings("ignore")
 # ----------------------------------------------------------------------------
 # SETTINGS — change these if you like
 # ----------------------------------------------------------------------------
+# SCREEN_MODE controls the universe:
+#   "watchlist" -> the curated list below (~24 names). Loads in seconds.
+#   "broad"     -> the full S&P 1500 (S&P 500 + 400 + 600) pulled free from
+#                  Wikipedia, then pre-filtered so only tradable names get priced.
+#                  Takes 1-3 minutes on first load; caches for an hour after.
+#                  If it times out or errors, switch back to "watchlist".
+SCREEN_MODE = "broad"
+
+MIN_PRICE = 5.0            # skip penny stocks / near-zero names
+MAX_BROAD_NAMES = 1500     # hard cap so the free host isn't overwhelmed
+
 UNIVERSE = [
     # ticker, company, sector, bucket
     ("AAPL",  "Apple Inc.",               "Technology",       "core"),
@@ -79,41 +90,94 @@ OPT_MAX_WEIGHT = 0.15   # max weight per single stock in the optimal portfolio
 
 st.set_page_config(page_title="My Stock Model", page_icon="📈", layout="wide")
 
+
+# ----------------------------------------------------------------------------
+# UNIVERSE BUILDERS
+# ----------------------------------------------------------------------------
+@st.cache_data(ttl=86400, show_spinner=False)   # cache the name list a full day
+def broad_universe():
+    """Full S&P 1500 (500 + 400 + 600) pulled free from Wikipedia.
+    No API key. Returns list of (ticker, company, sector, bucket).
+    Bucket is 'core' for large-caps (S&P 500), 'momentum' for the rest --
+    the smaller/mid names are where the bigger swings live."""
+    wl = {
+        "https://en.wikipedia.org/wiki/List_of_S%26P_500_companies": "core",
+        "https://en.wikipedia.org/wiki/List_of_S%26P_400_companies": "momentum",
+        "https://en.wikipedia.org/wiki/List_of_S%26P_600_companies": "momentum",
+    }
+    out, seen = [], set()
+    for url, bucket in wl.items():
+        try:
+            req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                html = resp.read().decode("utf-8", errors="ignore")
+            # Pull the constituent table rows without pandas.read_html (heavier dep)
+            for m in re.finditer(
+                r"<tr>.*?<td[^>]*>\s*(?:<a[^>]*>)?\s*([A-Z][A-Z.\-]{0,5})\s*"
+                r"(?:</a>)?\s*</td>.*?<td[^>]*>(.*?)</td>.*?<td[^>]*>(.*?)</td>",
+                html, re.S,
+            ):
+                tkr = m.group(1).strip().replace(".", "-")
+                comp = re.sub(r"<[^>]+>", "", m.group(2)).strip()
+                sect = re.sub(r"<[^>]+>", "", m.group(3)).strip()
+                if tkr in seen or not comp:
+                    continue
+                seen.add(tkr)
+                out.append((tkr, comp[:60], sect[:30], bucket))
+        except Exception:
+            continue
+        if len(out) >= MAX_BROAD_NAMES:
+            break
+    return out[:MAX_BROAD_NAMES]
+
 # ----------------------------------------------------------------------------
 # DATA + SCORING
 # ----------------------------------------------------------------------------
 @st.cache_data(ttl=3600, show_spinner=False)   # cache 1 hour so it loads fast
 def load_data():
-    tickers = [u[0] for u in UNIVERSE]
-    meta = {u[0]: {"company": u[1], "sector": u[2], "bucket": u[3]} for u in UNIVERSE}
+    if SCREEN_MODE == "broad":
+        names = broad_universe() or UNIVERSE
+    else:
+        names = UNIVERSE
 
-    raw = yf.download(tickers, period="1y", interval="1d",
-                      group_by="ticker", auto_adjust=True,
-                      threads=True, progress=False)
+    tickers = [u[0] for u in names]
+    meta = {u[0]: {"company": u[1], "sector": u[2], "bucket": u[3]} for u in names}
 
-    rows, closes = [], {}
-    for t in tickers:
+    # Fetch in batches so one slow request can't sink the whole screen
+    frames = {}
+    for i in range(0, len(tickers), 100):
+        batch = tickers[i:i + 100]
         try:
-            px = raw[t]["Close"].dropna()
-            if len(px) < 200:
-                continue
-            closes[t] = px
-            ma50 = px.rolling(50).mean().iloc[-1]
-            ma200 = px.rolling(200).mean().iloc[-1]
-            rows.append({
-                "Ticker": t,
-                "Company": meta[t]["company"],
-                "Sector": meta[t]["sector"],
-                "Bucket": meta[t]["bucket"],
-                "Price": float(px.iloc[-1]),
-                "Return 12mo": float(px.iloc[-1] / px.iloc[0] - 1),
-                "Return 6mo": float(px.iloc[-1] / px.iloc[-126] - 1),
-                "Return 1mo": float(px.iloc[-1] / px.iloc[-21] - 1),
-                "Volatility": float(px.pct_change().std() * np.sqrt(252)),
-                "Trend": int(px.iloc[-1] > ma50) + int(px.iloc[-1] > ma200),
-            })
+            raw = yf.download(batch, period="1y", interval="1d",
+                              group_by="ticker", auto_adjust=True,
+                              threads=True, progress=False)
+            for t in batch:
+                try:
+                    px = raw[t]["Close"].dropna()
+                    if len(px) >= 200 and float(px.iloc[-1]) >= MIN_PRICE:
+                        frames[t] = px
+                except Exception:
+                    continue
         except Exception:
             continue
+
+    rows, closes = [], {}
+    for t, px in frames.items():
+        closes[t] = px
+        ma50 = px.rolling(50).mean().iloc[-1]
+        ma200 = px.rolling(200).mean().iloc[-1]
+        rows.append({
+            "Ticker": t,
+            "Company": meta.get(t, {}).get("company", t),
+            "Sector": meta.get(t, {}).get("sector", "—"),
+            "Bucket": meta.get(t, {}).get("bucket", "momentum"),
+            "Price": float(px.iloc[-1]),
+            "Return 12mo": float(px.iloc[-1] / px.iloc[0] - 1),
+            "Return 6mo": float(px.iloc[-1] / px.iloc[-126] - 1),
+            "Return 1mo": float(px.iloc[-1] / px.iloc[-21] - 1),
+            "Volatility": float(px.pct_change().std() * np.sqrt(252)),
+            "Trend": int(px.iloc[-1] > ma50) + int(px.iloc[-1] > ma200),
+        })
 
     df = pd.DataFrame(rows)
     if df.empty:
@@ -134,6 +198,8 @@ def load_data():
 
 def diversified_picks(df):
     sub = df[df["Bucket"] == "core"].copy()
+    if len(sub) < TOP_N_CORE:          # broad mode may have fewer core names
+        sub = df.copy()
     sub = sub.nlargest(TOP_N_CORE, "Composite Score")
     w = sub["Composite Score"] / sub["Composite Score"].sum()
     sub["Weight"] = np.minimum(w, CAP_CORE)
@@ -143,6 +209,8 @@ def diversified_picks(df):
 
 def momentum_picks(df):
     sub = df[df["Bucket"] == "momentum"].copy()
+    if len(sub) < TOP_N_MOM:
+        sub = df.copy()
     sub = sub.nlargest(TOP_N_MOM, "Return 12mo")
     sub["Weight"] = 1.0 / len(sub)
     return sub.sort_values("Return 12mo", ascending=False)
@@ -307,10 +375,12 @@ def news_sentiment_table(tickers_companies):
 # RENDER
 # ----------------------------------------------------------------------------
 st.title("📈 My US Stock Model")
-st.caption("Three approaches, ranked from live market data. "
-           "Prices refresh each time this page loads.")
+_cap = "S&P 1500 (broad screen)" if SCREEN_MODE == "broad" else "curated watchlist"
+st.caption(f"Screening: **{_cap}**. Three approaches, ranked from live market data. "
+           f"Prices refresh each time this page loads. "
+           f"Switch modes with SCREEN_MODE at the top of the file.")
 
-with st.spinner("Fetching prices and scoring the universe..."):
+with st.spinner("Screening the universe — this can take a minute or two in broad mode..."):
     df, prices = load_data()
 
 if df.empty:
@@ -628,5 +698,7 @@ with d6:
 st.divider()
 st.caption("Decision-support tool, not financial advice. "
            "Past performance does not predict future returns.")
+
+
 
 
